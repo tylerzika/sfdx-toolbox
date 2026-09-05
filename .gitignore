@@ -1,0 +1,2 @@
+# Backups provision-home.sh makes before editing ~/.bashrc
+*.bak.*
