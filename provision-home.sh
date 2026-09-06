@@ -252,6 +252,8 @@ cat > "$HOME/.local/bin/sfdx-exp" <<'EXPEOF'
 #   sfdx-exp seed <name> [recipe]    generate fake data with Snowfakery
 #   sfdx-exp open <name>             open the org in a browser
 #   sfdx-exp rm   <name>             delete the scratch org, keep the snapshot
+#   sfdx-exp orgs                    what the Dev Hub is really counting
+#   sfdx-exp orgs prune <id>         release a slot the Dev Hub still counts
 #
 # Run from a Salesforce project root. Everything lands in ./experiments/<name>/.
 set -euo pipefail
@@ -261,11 +263,17 @@ set -euo pipefail
 
 export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true
 export SF_USE_GENERIC_UNIX_KEYCHAIN=true
+# sf --json colourises its output when the environment advertises colour, which
+# puts ANSI escapes inside the JSON body and makes every jq call below fail with
+# "Invalid numeric literal". Claude Code and some CI runners set FORCE_COLOR, so
+# this is not hypothetical. Force it off for our own subprocesses.
+export FORCE_COLOR=0
+export NO_COLOR=1
 
 ROOT="experiments"
 cmd="${1:-}"; name="${2:-}"
 org() { echo "exp-$1"; }
-usage() { sed -n '4,10p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; exit 1; }
+usage() { grep -E '^#   sfdx-exp' "$0" | sed 's/^# \{0,3\}//'; exit 1; }
 need() { [ -n "$name" ] || usage; }
 
 case "$cmd" in
@@ -374,7 +382,53 @@ seed)
   ;;
 
 open) need; sf org open -o "$(org "$name")" ;;
-rm)   need; sf org delete scratch -o "$(org "$name")" -p; echo ">> org deleted. $ROOT/$name kept." ;;
+rm)
+  need
+  if sf org delete scratch -o "$(org "$name")" -p; then
+    echo ">> org deleted. $ROOT/$name kept."
+  else
+    echo >&2
+    echo ">> delete failed, so the Dev Hub is probably still counting this org." >&2
+    echo "   A stale or missing auth file does this. Check and release the slot:" >&2
+    echo "     sfdx-exp orgs" >&2
+    exit 1
+  fi
+  ;;
+
+orgs)
+  # 'sf org list' shows what this machine has auth for. The Dev Hub is the
+  # authority on what consumes scratch org slots, and the two drift: a failed
+  # rm, a deleted auth file, or a create from another machine leaves an org
+  # counted against the limit with nothing local pointing at it.
+  hub="$(sf config get target-dev-hub --json 2>/dev/null | jq -r '.result[0].value // empty')"
+  [ -n "$hub" ] || { echo "no default Dev Hub" >&2; exit 1; }
+
+  if [ "$name" = "prune" ]; then
+    id="${3:-}"
+    [ -n "$id" ] || { echo "usage: sfdx-exp orgs prune <ActiveScratchOrg id>" >&2; exit 1; }
+    sf data delete record -o "$hub" -s ActiveScratchOrg -i "$id"
+    echo ">> slot released."
+    exit 0
+  fi
+
+  sf org list --json 2>/dev/null \
+    | jq -r '.result.scratchOrgs[]? | "\(.username)\t\(.alias // "-")"' \
+    > /tmp/.sfdx-exp-local || : > /tmp/.sfdx-exp-local
+
+  echo ">> scratch orgs the Dev Hub '$hub' is counting:"
+  printf '%-20s %-34s %-12s %s\n' ID USERNAME EXPIRES LOCAL
+  sf data query -o "$hub" --json \
+      -q "SELECT Id, SignupUsername, ExpirationDate FROM ActiveScratchOrg ORDER BY CreatedDate" 2>/dev/null \
+    | jq -r '.result.records[]? | "\(.Id)\t\(.SignupUsername)\t\(.ExpirationDate)"' \
+    | while IFS="$(printf '\t')" read -r id user exp; do
+        a="$(grep -F "$user" /tmp/.sfdx-exp-local | cut -f2 || true)"
+        printf '%-20s %-34s %-12s %s\n' "$id" "$user" "$exp" "${a:-ORPHAN}"
+      done
+  rm -f /tmp/.sfdx-exp-local
+  echo
+  echo "   ORPHAN means the Dev Hub counts it but this machine has no auth for it."
+  echo "   Release that slot with:  sfdx-exp orgs prune <id>"
+  ;;
 *)    usage ;;
 esac
 EXPEOF
