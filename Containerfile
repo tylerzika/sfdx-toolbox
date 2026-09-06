@@ -33,6 +33,7 @@ RUN dnf -y install \
       nodejs24 \
       nodejs24-npm \
       git \
+      gh \
       libsecret \
       xdg-utils \
       google-noto-sans-fonts \
